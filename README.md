@@ -13,7 +13,8 @@ ChronoSort permet de :
 - Aplatir une arborescence de dossiers
 - Renommer les fichiers avec une date fiable
 - Trier chronologiquement automatiquement
-- Détecter et isoler les doublons (exact + visuel)
+- Détecter et isoler les doublons (exact + visuel + contenu PDF)
+- Organiser les fichiers par catégorie dans la destination
 - Nettoyer les dossiers vides après déplacement
 - Ignorer les fichiers système (`.DS_Store`, `Thumbs.db`, etc.)
 
@@ -30,10 +31,60 @@ ChronoSort permet de :
 3. **🔍 Déduplication :**
    - SHA256 — doublon exact (tous fichiers)
    - pHash via BK-tree — doublon visuel (images uniquement, O(log n))
+   - Hash texte — doublon de contenu PDF (PDFs re-sauvegardés ou re-exportés)
 
-4. **📁 Organisation :**
-   - Fichiers uniques → racine de la destination
-   - Doublons → `/Doublon`
+4. **📁 Organisation automatique par catégorie :**
+
+```
+destination/
+├── Images/
+│   ├── JPG/
+│   ├── PNG/
+│   └── ...
+├── Vidéos/
+│   ├── MP4/
+│   ├── MKV/
+│   └── ...
+├── PDF/
+├── Word/
+├── Excel/
+├── PowerPoint/
+├── Audio/
+│   ├── MP3/
+│   └── ...
+├── Archives/
+├── Autres/
+└── Doublon/
+```
+
+> Les dossiers ne sont créés que si des fichiers correspondants sont présents.
+
+5. **🔄 Indexation de la destination au démarrage :**
+
+   À chaque lancement, ChronoSort commence par scanner les fichiers **déjà présents**
+   dans le dossier de destination et les intègre dans les structures de déduplication.
+   Cela signifie que **vous pouvez réutiliser le même dossier de destination à chaque
+   passe**, même si le dossier source change — aucun doublon ne sera introduit entre
+   deux sessions.
+
+   Le journal affiche explicitement cette phase au démarrage :
+   ```
+   🔍 Indexation de la destination : N fichier(s) déjà présent(s)…
+      (Les doublons avec ces fichiers seront détectés même si la source change.)
+   ✅ Indexation terminée — N fichier(s) référencé(s).
+   ```
+
+---
+
+## ⚠️ Recommandation importante
+
+> **Commencer avec un dossier de destination vierge est fortement conseillé
+> pour la première utilisation.**
+>
+> Si la destination contient déjà des fichiers non organisés ou issus d'un
+> autre outil, l'indexation initiale peut produire des résultats inattendus.
+> Pour les passes suivantes, réutiliser le même dossier de destination est
+> parfaitement sûr et recommandé.
 
 ---
 
@@ -44,6 +95,8 @@ Nécessite **Python 3.10+**.
 ```bash
 pip install -r requirements.txt
 ```
+
+> `pypdf` est requis pour la détection de doublons dans les PDFs.
 
 ---
 
@@ -108,7 +161,8 @@ ChronoSort.spec   ← fichier de configuration PyInstaller
 ## ⚠️ Limites
 
 - Détection visuelle : images uniquement (pHash)
-- Sur très gros volumes (> 100 000 fichiers), le pHash reste le goulot d'étranglement
+- Détection PDF : ne fonctionne pas sur les PDFs entièrement scannés (sans texte extractible) — le SHA256 prend le relais
+- Sur très gros volumes (> 100 000 fichiers), l'indexation initiale de la destination peut prendre quelques secondes supplémentaires
 
 ---
 

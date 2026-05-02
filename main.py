@@ -10,19 +10,73 @@ from PIL import Image
 from PIL.ExifTags import TAGS
 import imagehash
 import pybktree
+from pypdf import PdfReader
 
 # ─── Constantes ───────────────────────────────────────────────────────────────
-CHUNK_SIZE = 8192
-DEFAULT_PHASH_THRESHOLD = 5  # 0 = identique strict, 10 = très permissif
+CHUNK_SIZE              = 8192
+DEFAULT_PHASH_THRESHOLD = 5  # 0 = identique strict · 10 = très permissif
 
 SYSTEM_FILES = {
     ".DS_Store", "Thumbs.db", "desktop.ini",
     ".localized", ".Spotlight-V100", "ehthumbs.db",
 }
 
+# ─── Catégories et organisation ───────────────────────────────────────────────
+# Valeur : (dossier_catégorie, sous_dossier_par_extension)
+EXTENSION_CATEGORIES: dict[str, tuple[str, bool]] = {
+    # Images
+    ".jpg":  ("Images", True),  ".jpeg": ("Images", True),
+    ".png":  ("Images", True),  ".gif":  ("Images", True),
+    ".bmp":  ("Images", True),  ".tiff": ("Images", True),
+    ".tif":  ("Images", True),  ".webp": ("Images", True),
+    ".heic": ("Images", True),  ".heif": ("Images", True),
+    ".raw":  ("Images", True),  ".cr2":  ("Images", True),
+    ".nef":  ("Images", True),  ".arw":  ("Images", True),
+    # Vidéos
+    ".mp4":  ("Vidéos", True),  ".mov":  ("Vidéos", True),
+    ".avi":  ("Vidéos", True),  ".mkv":  ("Vidéos", True),
+    ".wmv":  ("Vidéos", True),  ".flv":  ("Vidéos", True),
+    ".webm": ("Vidéos", True),  ".m4v":  ("Vidéos", True),
+    ".3gp":  ("Vidéos", True),  ".mpg":  ("Vidéos", True),
+    ".mpeg": ("Vidéos", True),
+    # PDF
+    ".pdf":  ("PDF", False),
+    # Word
+    ".doc":  ("Word", False),   ".docx": ("Word", False),
+    ".odt":  ("Word", False),   ".rtf":  ("Word", False),
+    # Excel
+    ".xls":  ("Excel", False),  ".xlsx": ("Excel", False),
+    ".ods":  ("Excel", False),  ".csv":  ("Excel", False),
+    # PowerPoint
+    ".ppt":  ("PowerPoint", False), ".pptx": ("PowerPoint", False),
+    ".odp":  ("PowerPoint", False),
+    # Audio
+    ".mp3":  ("Audio", True),   ".wav":  ("Audio", True),
+    ".flac": ("Audio", True),   ".aac":  ("Audio", True),
+    ".ogg":  ("Audio", True),   ".wma":  ("Audio", True),
+    ".m4a":  ("Audio", True),   ".opus": ("Audio", True),
+    # Archives
+    ".zip":  ("Archives", False), ".rar": ("Archives", False),
+    ".7z":   ("Archives", False), ".tar": ("Archives", False),
+    ".gz":   ("Archives", False), ".bz2": ("Archives", False),
+}
+
+IMAGE_EXTENSIONS = {k for k, (c, _) in EXTENSION_CATEGORIES.items() if c == "Images"}
+
+
+def get_target_subfolder(file_path: str, target_dir: str) -> str:
+    """Retourne le dossier de destination selon l'extension du fichier."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in EXTENSION_CATEGORIES:
+        category, use_ext_subfolder = EXTENSION_CATEGORIES[ext]
+        if use_ext_subfolder:
+            return os.path.join(target_dir, category, ext.lstrip(".").upper())
+        return os.path.join(target_dir, category)
+    return os.path.join(target_dir, "Autres")
+
 
 # ─── Hash fichier (SHA256) ─────────────────────────────────────────────────────
-def get_file_hash(path):
+def get_file_hash(path: str) -> str | None:
     try:
         hasher = hashlib.sha256()
         with open(path, "rb") as f:
@@ -33,8 +87,8 @@ def get_file_hash(path):
         return None
 
 
-# ─── Hash visuel (images uniquement) ──────────────────────────────────────────
-def get_image_phash(path):
+# ─── Hash visuel pHash (images) ───────────────────────────────────────────────
+def get_image_phash(path: str):
     try:
         with Image.open(path) as img:
             return imagehash.phash(img)
@@ -42,11 +96,27 @@ def get_image_phash(path):
         return None
 
 
+# ─── Hash textuel PDF ─────────────────────────────────────────────────────────
+def get_pdf_text_hash(path: str) -> str | None:
+    """
+    Extrait le texte du PDF et retourne son hash SHA256.
+    Retourne None si le PDF est scanné (pas de texte extractible).
+    """
+    try:
+        reader = PdfReader(path)
+        text = "".join(page.extract_text() or "" for page in reader.pages)
+        if not text.strip():
+            return None  # PDF scanné — fallback SHA256 uniquement
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    except Exception:
+        return None
+
+
 # ─── EXIF ──────────────────────────────────────────────────────────────────────
-def get_exif_date(path):
+def get_exif_date(path: str) -> datetime | None:
     try:
         with Image.open(path) as image:
-            exif = image.getexif()  # API publique (Pillow >= 6.0)
+            exif = image.getexif()
             if exif:
                 for tag, value in exif.items():
                     tag_name = TAGS.get(tag, tag)
@@ -58,25 +128,89 @@ def get_exif_date(path):
 
 
 # ─── Fallback date ─────────────────────────────────────────────────────────────
-def get_file_date(path):
+def get_file_date(path: str) -> datetime | None:
     try:
         return datetime.fromtimestamp(os.path.getmtime(path))
     except Exception:
         return None
 
 
+# ─── Indexation de la destination existante ───────────────────────────────────
+def index_existing_destination(
+    target_dir:      str,
+    phash_threshold: int,
+    cancel_event:    threading.Event,
+    on_log,
+) -> tuple[dict, dict, pybktree.BKTree, bool]:
+    """
+    Parcourt les fichiers déjà présents dans la destination et pré-remplit
+    les structures de déduplication. Cela garantit qu'une nouvelle passe
+    avec un dossier source différent ne produira pas de doublons par rapport
+    aux fichiers déjà triés.
+
+    Retourne : (hashes_seen, pdf_hashes_seen, phash_tree, tree_is_empty)
+    """
+    hashes_seen     = {}
+    pdf_hashes_seen = {}
+    phash_tree      = pybktree.BKTree(lambda a, b: abs(a - b))
+    tree_is_empty   = True
+
+    if not os.path.isdir(target_dir):
+        return hashes_seen, pdf_hashes_seen, phash_tree, tree_is_empty
+
+    existing_files = []
+    for root, _, files in os.walk(target_dir):
+        for f in files:
+            if f in SYSTEM_FILES or f.startswith("."):
+                continue
+            existing_files.append(os.path.join(root, f))
+
+    count = len(existing_files)
+
+    if count == 0:
+        on_log("📂 Destination vierge — aucun fichier existant à indexer.\n")
+        return hashes_seen, pdf_hashes_seen, phash_tree, tree_is_empty
+
+    on_log(f"🔍 Indexation de la destination : {count} fichier(s) déjà présent(s)…")
+    on_log(   "   (Les doublons avec ces fichiers seront détectés même si la source change.)\n")
+
+    indexed = 0
+    for path in existing_files:
+        if cancel_event.is_set():
+            break
+
+        ext = os.path.splitext(path)[1].lower()
+
+        file_hash = get_file_hash(path)
+        if file_hash:
+            hashes_seen[file_hash] = path
+
+        if ext in IMAGE_EXTENSIONS:
+            phash = get_image_phash(path)
+            if phash:
+                phash_tree.add(phash)
+                tree_is_empty = False
+
+        if ext == ".pdf":
+            pdf_text_hash = get_pdf_text_hash(path)
+            if pdf_text_hash:
+                pdf_hashes_seen[pdf_text_hash] = path
+
+        indexed += 1
+
+    on_log(f"✅ Indexation terminée — {indexed} fichier(s) référencé(s).\n")
+    return hashes_seen, pdf_hashes_seen, phash_tree, tree_is_empty
+
+
 # ─── Traitement principal ──────────────────────────────────────────────────────
-def process_files(source_dir, target_dir, move_files, phash_threshold, cancel_event, callbacks):
-    """
-    Paramètres
-    ----------
-    source_dir       : dossier source
-    target_dir       : dossier destination
-    move_files       : True = déplacer, False = copier
-    phash_threshold  : seuil de tolérance pour la similarité visuelle
-    cancel_event     : threading.Event — déclenché = annulation demandée
-    callbacks        : dict {on_progress, on_log, on_done}
-    """
+def process_files(
+    source_dir:      str,
+    target_dir:      str,
+    move_files:      bool,
+    phash_threshold: int,
+    cancel_event:    threading.Event,
+    callbacks:       dict,
+):
     on_progress = callbacks["on_progress"]
     on_log      = callbacks["on_log"]
     on_done     = callbacks["on_done"]
@@ -94,7 +228,17 @@ def process_files(source_dir, target_dir, move_files, phash_threshold, cancel_ev
 
     os.makedirs(target_dir, exist_ok=True)
 
-    # ── Scan initial ───────────────────────────────────────────────────────────
+    # ── Indexation de la destination existante ─────────────────────────────────
+    hashes_seen, pdf_hashes_seen, phash_tree, tree_is_empty = index_existing_destination(
+        target_dir, phash_threshold, cancel_event, on_log
+    )
+
+    if cancel_event.is_set():
+        on_log("⚠️  Annulé pendant l'indexation.")
+        on_done(None)
+        return
+
+    # ── Scan de la source ──────────────────────────────────────────────────────
     all_files = []
     for root, _, files in os.walk(source_dir):
         for f in files:
@@ -103,17 +247,12 @@ def process_files(source_dir, target_dir, move_files, phash_threshold, cancel_ev
             all_files.append(os.path.join(root, f))
 
     total = len(all_files)
-    on_log(f"📂 {total} fichier(s) trouvé(s) — démarrage du traitement…\n")
+    on_log(f"📂 {total} fichier(s) trouvé(s) dans la source — démarrage du traitement…\n")
 
     if total == 0:
         on_log("⚠️  Aucun fichier à traiter.")
         on_done({"ok": 0, "duplicate": 0, "error": 0})
         return
-
-    # ── Structures de déduplication ────────────────────────────────────────────
-    hashes_seen  = {}
-    phash_tree   = pybktree.BKTree(lambda a, b: abs(a - b))
-    tree_is_empty = True
 
     doublon_dir = os.path.join(target_dir, "Doublon")
     stats = {"ok": 0, "duplicate": 0, "error": 0}
@@ -128,66 +267,89 @@ def process_files(source_dir, target_dir, move_files, phash_threshold, cancel_ev
 
         on_progress(i + 1, total)
         file_name = os.path.basename(source_file)
+        ext       = os.path.splitext(file_name)[1].lower()
 
-        # Doublon exact (hash SHA256)
+        # ── Doublon exact (SHA256) ─────────────────────────────────────────────
         file_hash    = get_file_hash(source_file)
         is_duplicate = bool(file_hash and file_hash in hashes_seen)
 
-        # Doublon visuel (pHash, images uniquement)
+        # ── Doublon visuel pHash (images uniquement) ───────────────────────────
         visual_duplicate = False
-        phash = get_image_phash(source_file)
+        phash = None
 
-        if phash and not tree_is_empty:
-            if phash_tree.find(phash, phash_threshold):
-                visual_duplicate = True
+        if not is_duplicate and ext in IMAGE_EXTENSIONS:
+            phash = get_image_phash(source_file)
+            if phash and not tree_is_empty:
+                if phash_tree.find(phash, phash_threshold):
+                    visual_duplicate = True
 
-        # Date de référence
+        # ── Doublon textuel PDF ────────────────────────────────────────────────
+        pdf_duplicate = False
+        pdf_text_hash = None
+
+        if not is_duplicate and not visual_duplicate and ext == ".pdf":
+            pdf_text_hash = get_pdf_text_hash(source_file)
+            if pdf_text_hash and pdf_text_hash in pdf_hashes_seen:
+                pdf_duplicate = True
+
+        # ── Date de référence ──────────────────────────────────────────────────
         date     = get_exif_date(source_file) or get_file_date(source_file)
         date_str = date.strftime("%Y-%m-%d_%H-%M-%S") if date else "unknown_date"
         new_name = f"{date_str}_{file_name}"
 
-        # Choix de la destination
-        if is_duplicate or visual_duplicate:
+        # ── Choix de la destination ────────────────────────────────────────────
+        if is_duplicate or visual_duplicate or pdf_duplicate:
             os.makedirs(doublon_dir, exist_ok=True)
             target_base = doublon_dir
-            reason      = "HASH" if is_duplicate else "VISUEL"
-            on_log(f"  [DOUBLON {reason}] {file_name}")
+
+            if is_duplicate:
+                dup_reason = "HASH"
+            elif visual_duplicate:
+                dup_reason = "VISUEL"
+            else:
+                dup_reason = "PDF"
+
+            on_log(f"  [DOUBLON {dup_reason}] {file_name}")
             stats["duplicate"] += 1
         else:
-            target_base = target_dir
+            target_base = get_target_subfolder(source_file, target_dir)
+            os.makedirs(target_base, exist_ok=True)
 
-        # Résolution des conflits de noms
-        target_file = os.path.join(target_base, new_name)
-        base, ext   = os.path.splitext(new_name)
-        counter     = 1
+        # ── Résolution des conflits de noms ────────────────────────────────────
+        target_file    = os.path.join(target_base, new_name)
+        base, ext_orig = os.path.splitext(new_name)
+        counter        = 1
         while os.path.exists(target_file):
-            target_file = os.path.join(target_base, f"{base}_{counter}{ext}")
+            target_file = os.path.join(target_base, f"{base}_{counter}{ext_orig}")
             counter += 1
 
-        # Copie / déplacement
+        # ── Copie / déplacement ────────────────────────────────────────────────
         try:
             if move_files:
                 shutil.move(source_file, target_file)
             else:
                 shutil.copy2(source_file, target_file)
-            on_log(f"  [OK] {file_name}  →  {os.path.relpath(target_file, target_dir)}")
+
+            rel = os.path.relpath(target_file, target_dir)
+            on_log(f"  [OK] {file_name}  →  {rel}")
             stats["ok"] += 1
         except Exception as e:
             on_log(f"  [ERREUR] {file_name} : {e}")
             stats["error"] += 1
             continue
 
-        # Mise à jour des structures de déduplication
+        # ── Mise à jour des structures de déduplication ────────────────────────
         if file_hash:
             hashes_seen[file_hash] = target_file
-
         if phash:
             phash_tree.add(phash)
             tree_is_empty = False
+        if pdf_text_hash:
+            pdf_hashes_seen[pdf_text_hash] = target_file
 
-    # ── Nettoyage des dossiers vides (déplacement uniquement) ──────────────────
+    # ── Nettoyage des dossiers vides (mode déplacement uniquement) ─────────────
     if move_files:
-        for root, _, files in os.walk(source_dir, topdown=False):
+        for root, _, _ in os.walk(source_dir, topdown=False):
             if not os.listdir(root):
                 try:
                     os.rmdir(root)
@@ -207,10 +369,7 @@ class ChronoSortApp:
         self.cancel_event = threading.Event()
         self._build_ui()
 
-    # ── Construction de l'interface ────────────────────────────────────────────
     def _build_ui(self):
-        PAD = {"padx": 10, "pady": 4}
-
         # ── Dossiers ──────────────────────────────────────────────────────────
         frame_paths = ttk.LabelFrame(self.root, text=" Dossiers ", padding=8)
         frame_paths.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
@@ -224,6 +383,17 @@ class ChronoSortApp:
         self.target_var = tk.StringVar()
         ttk.Entry(frame_paths, textvariable=self.target_var, width=52).grid(row=1, column=1, padx=6, pady=(6, 0))
         ttk.Button(frame_paths, text="Parcourir…", command=self._pick_target).grid(row=1, column=2, pady=(6, 0))
+
+        # ── Note informationnelle ──────────────────────────────────────────────
+        note = (
+            "ℹ️  Vous pouvez réutiliser le même dossier de destination à chaque passe.\n"
+            "   Les fichiers déjà présents seront indexés au démarrage : aucun doublon\n"
+            "   ne sera introduit, même si le dossier source change."
+        )
+        ttk.Label(
+            frame_paths, text=note,
+            foreground="#888888", font=("TkDefaultFont", 8), justify="left"
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 2))
 
         # ── Options ───────────────────────────────────────────────────────────
         frame_opts = ttk.LabelFrame(self.root, text=" Options ", padding=8)
@@ -278,7 +448,6 @@ class ChronoSortApp:
         )
         self.log_area.pack()
 
-    # ── Sélecteurs de dossiers ─────────────────────────────────────────────────
     def _pick_source(self):
         path = filedialog.askdirectory(title="Choisir le dossier source")
         if path:
@@ -289,20 +458,17 @@ class ChronoSortApp:
         if path:
             self.target_var.set(path)
 
-    # ── Mise à jour du journal (thread-safe via root.after) ───────────────────
     def _log(self, message: str):
         self.log_area.config(state="normal")
         self.log_area.insert("end", message + "\n")
         self.log_area.see("end")
         self.log_area.config(state="disabled")
 
-    # ── Mise à jour de la barre de progression ─────────────────────────────────
     def _on_progress(self, current: int, total: int):
         pct = (current / total) * 100 if total > 0 else 0
         self.progress_var.set(pct)
         self.progress_label.config(text=f"{current} / {total} fichiers")
 
-    # ── Fin du traitement ──────────────────────────────────────────────────────
     def _on_done(self, stats: dict | None):
         self.start_btn.config(state="normal")
         self.cancel_btn.config(state="disabled")
@@ -316,7 +482,6 @@ class ChronoSortApp:
             )
             self.progress_label.config(text="Terminé !")
 
-    # ── Lancement ─────────────────────────────────────────────────────────────
     def _start(self):
         source = self.source_var.get().strip()
         target = self.target_var.get().strip()
@@ -325,7 +490,6 @@ class ChronoSortApp:
             self._log("❌ Veuillez sélectionner les dossiers source et destination.")
             return
 
-        # Réinitialisation
         self.cancel_event.clear()
         self.start_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
@@ -354,7 +518,6 @@ class ChronoSortApp:
         )
         thread.start()
 
-    # ── Annulation ────────────────────────────────────────────────────────────
     def _cancel(self):
         self.cancel_event.set()
         self.cancel_btn.config(state="disabled")
