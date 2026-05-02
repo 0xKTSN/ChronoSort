@@ -64,15 +64,18 @@ EXTENSION_CATEGORIES: dict[str, tuple[str, bool]] = {
 IMAGE_EXTENSIONS = {k for k, (c, _) in EXTENSION_CATEGORIES.items() if c == "Images"}
 
 
-def get_target_subfolder(file_path: str, target_dir: str) -> str:
-    """Retourne le dossier de destination selon l'extension du fichier."""
+def get_category_subfolder(file_path: str, base_dir: str) -> str:
+    """
+    Retourne le sous-dossier catégorisé pour un fichier donné,
+    à partir d'un dossier de base (destination ou Doublon).
+    """
     ext = os.path.splitext(file_path)[1].lower()
     if ext in EXTENSION_CATEGORIES:
         category, use_ext_subfolder = EXTENSION_CATEGORIES[ext]
         if use_ext_subfolder:
-            return os.path.join(target_dir, category, ext.lstrip(".").upper())
-        return os.path.join(target_dir, category)
-    return os.path.join(target_dir, "Autres")
+            return os.path.join(base_dir, category, ext.lstrip(".").upper())
+        return os.path.join(base_dir, category)
+    return os.path.join(base_dir, "Autres")
 
 
 # ─── Hash fichier (SHA256) ─────────────────────────────────────────────────────
@@ -206,12 +209,13 @@ def index_existing_destination(
 
 # ─── Traitement principal ──────────────────────────────────────────────────────
 def process_files(
-    source_dir:      str,
-    target_dir:      str,
-    move_files:      bool,
-    phash_threshold: int,
-    cancel_event:    threading.Event,
-    callbacks:       dict,
+    source_dir:          str,
+    target_dir:          str,
+    move_files:          bool,
+    phash_threshold:     int,
+    delete_exact_dupes:  bool,
+    cancel_event:        threading.Event,
+    callbacks:           dict,
 ):
     on_progress = callbacks["on_progress"]
     on_log      = callbacks["on_log"]
@@ -256,11 +260,11 @@ def process_files(
 
     if total == 0:
         on_log("⚠️  Aucun fichier à traiter.")
-        on_done({"ok": 0, "duplicate": 0, "error": 0})
+        on_done({"ok": 0, "deleted": 0, "duplicate": 0, "error": 0})
         return
 
     doublon_dir = os.path.join(target_dir, "Doublon")
-    stats = {"ok": 0, "duplicate": 0, "error": 0}
+    stats = {"ok": 0, "deleted": 0, "duplicate": 0, "error": 0}
 
     # ── Boucle principale ──────────────────────────────────────────────────────
     for i, source_file in enumerate(all_files):
@@ -302,22 +306,38 @@ def process_files(
         date_str = date.strftime("%Y-%m-%d_%H-%M-%S") if date else "unknown_date"
         new_name = f"{date_str}_{file_name}"
 
-        # ── Choix de la destination ────────────────────────────────────────────
-        if is_duplicate or visual_duplicate or pdf_duplicate:
-            os.makedirs(doublon_dir, exist_ok=True)
-            target_base = doublon_dir
+        # ── Traitement selon le type de doublon ────────────────────────────────
+        if is_duplicate:
+            # SHA256 identique → suppression directe ou déplacement selon option
+            if delete_exact_dupes:
+                try:
+                    os.remove(source_file)
+                    on_log(f"  [SUPPRIMÉ] {file_name}  (doublon exact SHA256)")
+                    stats["deleted"] += 1
+                except Exception as e:
+                    on_log(f"  [ERREUR] {file_name} : {e}")
+                    stats["error"] += 1
+                # Pas besoin de mettre à jour hashes_seen, le hash existe déjà
+                continue
 
-            if is_duplicate:
-                dup_reason = "HASH"
-            elif visual_duplicate:
-                dup_reason = "VISUEL"
             else:
-                dup_reason = "PDF"
+                # Déplacement vers Doublon/ catégorisé
+                target_base = get_category_subfolder(source_file, doublon_dir)
+                os.makedirs(target_base, exist_ok=True)
+                on_log(f"  [DOUBLON HASH] {file_name}")
+                stats["duplicate"] += 1
 
+        elif visual_duplicate or pdf_duplicate:
+            # pHash ou PDF → toujours vers Doublon/ catégorisé (pas de suppression auto)
+            target_base = get_category_subfolder(source_file, doublon_dir)
+            os.makedirs(target_base, exist_ok=True)
+            dup_reason = "VISUEL" if visual_duplicate else "PDF"
             on_log(f"  [DOUBLON {dup_reason}] {file_name}")
             stats["duplicate"] += 1
+
         else:
-            target_base = get_target_subfolder(source_file, target_dir)
+            # Fichier unique → destination catégorisée
+            target_base = get_category_subfolder(source_file, target_dir)
             os.makedirs(target_base, exist_ok=True)
 
         # ── Résolution des conflits de noms ────────────────────────────────────
@@ -335,21 +355,23 @@ def process_files(
             else:
                 shutil.copy2(source_file, target_file)
 
-            rel = os.path.relpath(target_file, target_dir)
-            on_log(f"  [OK] {file_name}  →  {rel}")
-            stats["ok"] += 1
+            if not is_duplicate and not visual_duplicate and not pdf_duplicate:
+                rel = os.path.relpath(target_file, target_dir)
+                on_log(f"  [OK] {file_name}  →  {rel}")
+                stats["ok"] += 1
+
         except Exception as e:
             on_log(f"  [ERREUR] {file_name} : {e}")
             stats["error"] += 1
             continue
 
         # ── Mise à jour des structures de déduplication ────────────────────────
-        if file_hash:
+        if file_hash and not is_duplicate:
             hashes_seen[file_hash] = target_file
         if phash:
             phash_tree.add(phash)
             tree_is_empty = False
-        if pdf_text_hash:
+        if pdf_text_hash and not pdf_duplicate:
             pdf_hashes_seen[pdf_text_hash] = target_file
 
     # ── Nettoyage des dossiers vides (mode déplacement uniquement) ─────────────
@@ -410,14 +432,34 @@ class ChronoSortApp:
             variable=self.move_var
         ).grid(row=0, column=0, columnspan=3, sticky="w")
 
+        # Option suppression doublons exacts
+        self.delete_exact_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame_opts,
+            text="Supprimer les doublons exacts (SHA256) — sans confirmation",
+            variable=self.delete_exact_var,
+            command=self._on_delete_exact_toggle,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        self.delete_note = ttk.Label(
+            frame_opts,
+            text=(
+                "   ⚠️  Les doublons visuels (pHash) et PDF restent toujours déplacés\n"
+                "        vers Doublon/ pour vérification manuelle."
+            ),
+            foreground="#888888", font=("TkDefaultFont", 8), justify="left",
+        )
+        self.delete_note.grid(row=2, column=0, columnspan=3, sticky="w")
+        self.delete_note.grid_remove()  # masqué par défaut
+
         ttk.Label(frame_opts, text="Seuil similarité visuelle (0 = strict · 10 = permissif) :").grid(
-            row=1, column=0, sticky="w", pady=(6, 0)
+            row=3, column=0, sticky="w", pady=(8, 0)
         )
         self.threshold_var = tk.IntVar(value=DEFAULT_PHASH_THRESHOLD)
         ttk.Spinbox(
             frame_opts, from_=0, to=10, textvariable=self.threshold_var,
             width=5, state="readonly"
-        ).grid(row=1, column=1, sticky="w", padx=8, pady=(6, 0))
+        ).grid(row=3, column=1, sticky="w", padx=8, pady=(8, 0))
 
         # ── Boutons ───────────────────────────────────────────────────────────
         frame_btns = ttk.Frame(self.root)
@@ -453,6 +495,13 @@ class ChronoSortApp:
         )
         self.log_area.pack()
 
+    def _on_delete_exact_toggle(self):
+        """Affiche ou masque la note explicative selon l'état de la case."""
+        if self.delete_exact_var.get():
+            self.delete_note.grid()
+        else:
+            self.delete_note.grid_remove()
+
     def _pick_source(self):
         path = filedialog.askdirectory(title="Choisir le dossier source")
         if path:
@@ -480,9 +529,10 @@ class ChronoSortApp:
         if stats is not None:
             self._log(
                 f"\n{'─'*60}\n"
-                f"  ✅ Traités   : {stats['ok']}\n"
-                f"  📋 Doublons  : {stats['duplicate']}\n"
-                f"  ❌ Erreurs   : {stats['error']}\n"
+                f"  ✅ Traités      : {stats['ok']}\n"
+                f"  🗑️  Supprimés    : {stats['deleted']}\n"
+                f"  📋 Doublons     : {stats['duplicate']}\n"
+                f"  ❌ Erreurs      : {stats['error']}\n"
                 f"{'─'*60}"
             )
             self.progress_label.config(text="Terminé !")
@@ -506,8 +556,8 @@ class ChronoSortApp:
 
         callbacks = {
             "on_progress": lambda c, t, l="": self.root.after(0, self._on_progress, c, t, l),
-            "on_log":      lambda msg:  self.root.after(0, self._log, msg),
-            "on_done":     lambda s:    self.root.after(0, self._on_done, s),
+            "on_log":      lambda msg:         self.root.after(0, self._log, msg),
+            "on_done":     lambda s:           self.root.after(0, self._on_done, s),
         }
 
         thread = threading.Thread(
@@ -516,6 +566,7 @@ class ChronoSortApp:
                 source, target,
                 self.move_var.get(),
                 self.threshold_var.get(),
+                self.delete_exact_var.get(),
                 self.cancel_event,
                 callbacks,
             ),

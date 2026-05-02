@@ -13,7 +13,8 @@ ChronoSort permet de :
 - Aplatir une arborescence de dossiers
 - Renommer les fichiers avec une date fiable
 - Trier chronologiquement automatiquement
-- Détecter et isoler les doublons (exact + visuel + contenu PDF)
+- Détecter et isoler les doublons (exact SHA256 + visuel pHash + contenu PDF)
+- Supprimer automatiquement les doublons exacts (optionnel)
 - Organiser les fichiers par catégorie dans la destination
 - Nettoyer les dossiers vides après déplacement
 - Ignorer les fichiers système (`.DS_Store`, `Thumbs.db`, etc.)
@@ -22,24 +23,36 @@ ChronoSort permet de :
 
 ## 🧠 Fonctionnement
 
-1. **📅 Date :**
-   - EXIF via API publique `getexif()` (priorité)
-   - Fallback : date de modification du fichier
+### 1. 📅 Date de référence
+- EXIF via API publique `getexif()` (priorité)
+- Fallback : date de modification du fichier
 
-2. **🏷️ Nom :** `YYYY-MM-DD_HH-MM-SS_nom.ext`
+### 2. 🏷️ Renommage
+`YYYY-MM-DD_HH-MM-SS_nom_original.ext`
 
-3. **🔍 Déduplication :**
-   - SHA256 — doublon exact (tous fichiers)
-   - pHash via BK-tree — doublon visuel (images uniquement, O(log n))
-   - Hash texte — doublon de contenu PDF (PDFs re-sauvegardés ou re-exportés)
+### 3. 🔍 Déduplication
 
-4. **📁 Organisation automatique par catégorie :**
+| Méthode | Scope | Action par défaut | Si option activée |
+|---|---|---|---|
+| SHA256 | Tous fichiers | Déplacement vers `Doublon/` | **Suppression directe** |
+| pHash | Images uniquement | Déplacement vers `Doublon/` | Déplacement vers `Doublon/` |
+| Hash texte | PDFs uniquement | Déplacement vers `Doublon/` | Déplacement vers `Doublon/` |
+
+> Les doublons visuels (pHash) et PDF ne sont **jamais supprimés automatiquement**,
+> même si l'option de suppression des doublons exacts est activée — ils sont toujours
+> déplacés vers `Doublon/` pour vérification manuelle.
+
+### 4. 📁 Organisation automatique par catégorie
+
+Les fichiers uniques sont triés dans la destination, les doublons non exacts dans `Doublon/`,
+selon la même structure :
 
 ```
 destination/
 ├── Images/
 │   ├── JPG/
 │   ├── PNG/
+│   ├── HEIC/
 │   └── ...
 ├── Vidéos/
 │   ├── MP4/
@@ -51,28 +64,34 @@ destination/
 ├── PowerPoint/
 ├── Audio/
 │   ├── MP3/
+│   ├── FLAC/
 │   └── ...
 ├── Archives/
 ├── Autres/
 └── Doublon/
+    ├── Images/
+    │   ├── JPG/
+    │   └── ...
+    ├── PDF/
+    └── ...
 ```
 
 > Les dossiers ne sont créés que si des fichiers correspondants sont présents.
 
-5. **🔄 Indexation de la destination au démarrage :**
+### 5. 🔄 Indexation de la destination au démarrage
 
-   À chaque lancement, ChronoSort commence par scanner les fichiers **déjà présents**
-   dans le dossier de destination et les intègre dans les structures de déduplication.
-   Cela signifie que **vous pouvez réutiliser le même dossier de destination à chaque
-   passe**, même si le dossier source change — aucun doublon ne sera introduit entre
-   deux sessions.
+À chaque lancement, ChronoSort commence par scanner les fichiers **déjà présents**
+dans le dossier de destination et les intègre dans les structures de déduplication.
+Cela signifie que **vous pouvez réutiliser le même dossier de destination à chaque
+passe**, même si le dossier source change — aucun doublon ne sera introduit entre
+deux sessions.
 
-   Le journal affiche explicitement cette phase au démarrage :
-   ```
-   🔍 Indexation de la destination : N fichier(s) déjà présent(s)…
-      (Les doublons avec ces fichiers seront détectés même si la source change.)
-   ✅ Indexation terminée — N fichier(s) référencé(s).
-   ```
+Le journal affiche explicitement cette phase :
+```
+🔍 Indexation de la destination : N fichier(s) déjà présent(s)…
+   (Les doublons avec ces fichiers seront détectés même si la source change.)
+✅ Indexation terminée — N fichier(s) référencé(s).
+```
 
 ---
 
@@ -96,8 +115,6 @@ Nécessite **Python 3.10+**.
 pip install -r requirements.txt
 ```
 
-> `pypdf` est requis pour la détection de doublons dans les PDFs.
-
 ---
 
 ## ▶️ Utilisation (script Python)
@@ -106,13 +123,23 @@ pip install -r requirements.txt
 python main.py
 ```
 
-L'interface graphique permet de :
+### Options disponibles dans l'interface
 
-- Choisir les dossiers source et destination
-- Activer le mode déplacement (au lieu de copie)
-- Régler le seuil de similarité visuelle (0 = strict · 10 = permissif)
-- Suivre la progression en temps réel
-- Annuler le traitement à tout moment
+| Option | Détail |
+|---|---|
+| **Déplacer les fichiers** | Déplace au lieu de copier ; supprime les dossiers vides après passage |
+| **Supprimer les doublons exacts (SHA256)** | Supprime directement les doublons identiques bit pour bit, sans confirmation. Les doublons visuels et PDF restent déplacés vers `Doublon/` |
+| **Seuil similarité visuelle** | De 0 (identique strict) à 10 (très permissif). Contrôle la tolérance du pHash pour les images |
+| **Annuler** | Interrompt proprement le traitement en cours |
+
+### Résumé affiché en fin de traitement
+
+```
+✅ Traités      : 1 842
+🗑️  Supprimés    : 312
+📋 Doublons     : 47
+❌ Erreurs      : 0
+```
 
 ---
 
@@ -160,7 +187,7 @@ ChronoSort.spec   ← fichier de configuration PyInstaller
 
 ## ⚠️ Limites
 
-- Détection visuelle : images uniquement (pHash)
+- Détection visuelle (pHash) : images uniquement
 - Détection PDF : ne fonctionne pas sur les PDFs entièrement scannés (sans texte extractible) — le SHA256 prend le relais
 - Sur très gros volumes (> 100 000 fichiers), l'indexation initiale de la destination peut prendre quelques secondes supplémentaires
 
