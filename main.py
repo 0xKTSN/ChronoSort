@@ -141,6 +141,7 @@ def index_existing_destination(
     phash_threshold: int,
     cancel_event:    threading.Event,
     on_log,
+    on_progress,
 ) -> tuple[dict, dict, pybktree.BKTree, bool]:
     """
     Parcourt les fichiers déjà présents dans la destination et pré-remplit
@@ -197,6 +198,7 @@ def index_existing_destination(
                 pdf_hashes_seen[pdf_text_hash] = path
 
         indexed += 1
+        on_progress(indexed, count, f"Indexation : {indexed} / {count}")
 
     on_log(f"✅ Indexation terminée — {indexed} fichier(s) référencé(s).\n")
     return hashes_seen, pdf_hashes_seen, phash_tree, tree_is_empty
@@ -230,13 +232,16 @@ def process_files(
 
     # ── Indexation de la destination existante ─────────────────────────────────
     hashes_seen, pdf_hashes_seen, phash_tree, tree_is_empty = index_existing_destination(
-        target_dir, phash_threshold, cancel_event, on_log
+        target_dir, phash_threshold, cancel_event, on_log, on_progress
     )
 
     if cancel_event.is_set():
         on_log("⚠️  Annulé pendant l'indexation.")
         on_done(None)
         return
+
+    # Remise à zéro de la barre avant le traitement principal
+    on_progress(0, 1, "")
 
     # ── Scan de la source ──────────────────────────────────────────────────────
     all_files = []
@@ -265,7 +270,7 @@ def process_files(
             on_done(stats)
             return
 
-        on_progress(i + 1, total)
+        on_progress(i + 1, total, f"Traitement : {i + 1} / {total}")
         file_name = os.path.basename(source_file)
         ext       = os.path.splitext(file_name)[1].lower()
 
@@ -464,10 +469,10 @@ class ChronoSortApp:
         self.log_area.see("end")
         self.log_area.config(state="disabled")
 
-    def _on_progress(self, current: int, total: int):
+    def _on_progress(self, current: int, total: int, label: str = ""):
         pct = (current / total) * 100 if total > 0 else 0
         self.progress_var.set(pct)
-        self.progress_label.config(text=f"{current} / {total} fichiers")
+        self.progress_label.config(text=label)
 
     def _on_done(self, stats: dict | None):
         self.start_btn.config(state="normal")
@@ -500,7 +505,7 @@ class ChronoSortApp:
         self.log_area.config(state="disabled")
 
         callbacks = {
-            "on_progress": lambda c, t: self.root.after(0, self._on_progress, c, t),
+            "on_progress": lambda c, t, l="": self.root.after(0, self._on_progress, c, t, l),
             "on_log":      lambda msg:  self.root.after(0, self._log, msg),
             "on_done":     lambda s:    self.root.after(0, self._on_done, s),
         }
