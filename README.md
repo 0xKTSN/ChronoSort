@@ -8,44 +8,27 @@
 
 ## 🚀 Objectif
 
-ChronoSort permet de :
+ChronoSort propose deux modes distincts pour gérer vos fichiers :
 
-- Aplatir une arborescence de dossiers
-- Renommer les fichiers avec une date fiable
-- Trier chronologiquement automatiquement
-- Détecter et isoler les doublons (exact SHA256 + visuel pHash + contenu PDF)
-- Supprimer automatiquement les doublons exacts (optionnel)
-- Organiser les fichiers par catégorie dans la destination
-- Nettoyer les dossiers vides après déplacement
-- Ignorer les fichiers système (`.DS_Store`, `Thumbs.db`, etc.)
+- **Mode Tri** — renomme, classe par catégorie, déduplique via SHA256 + pHash + contenu PDF
+- **Mode Miroir** — reproduit l'arborescence source, déduplique uniquement via SHA256
+
+Dans les deux cas : indexation de la destination au démarrage, progression en temps réel, annulation possible.
 
 ---
 
 ## 🧠 Fonctionnement
 
-### 1. 📅 Date de référence
-- EXIF via API publique `getexif()` (priorité)
+### ✦ Mode Tri
+
+Conçu pour organiser un dossier chaotique de fichiers en une bibliothèque propre et structurée.
+
+**1. Renommage par date**
+- EXIF via `getexif()` (priorité pour les photos)
 - Fallback : date de modification du fichier
+- Format : `YYYY-MM-DD_HH-MM-SS_nom_original.ext`
 
-### 2. 🏷️ Renommage
-`YYYY-MM-DD_HH-MM-SS_nom_original.ext`
-
-### 3. 🔍 Déduplication
-
-| Méthode | Scope | Action par défaut | Si option activée |
-|---|---|---|---|
-| SHA256 | Tous fichiers | Déplacement vers `Doublon/` | **Suppression directe** |
-| pHash | Images uniquement | Déplacement vers `Doublon/` | Déplacement vers `Doublon/` |
-| Hash texte | PDFs uniquement | Déplacement vers `Doublon/` | Déplacement vers `Doublon/` |
-
-> Les doublons visuels (pHash) et PDF ne sont **jamais supprimés automatiquement**,
-> même si l'option de suppression des doublons exacts est activée — ils sont toujours
-> déplacés vers `Doublon/` pour vérification manuelle.
-
-### 4. 📁 Organisation automatique par catégorie
-
-Les fichiers uniques sont triés dans la destination, les doublons non exacts dans `Doublon/`,
-selon la même structure :
+**2. Organisation automatique par catégorie**
 
 ```
 destination/
@@ -78,19 +61,53 @@ destination/
 
 > Les dossiers ne sont créés que si des fichiers correspondants sont présents.
 
-### 5. 🔄 Indexation de la destination au démarrage
+**3. Déduplication**
 
-À chaque lancement, ChronoSort commence par scanner les fichiers **déjà présents**
-dans le dossier de destination et les intègre dans les structures de déduplication.
-Cela signifie que **vous pouvez réutiliser le même dossier de destination à chaque
-passe**, même si le dossier source change — aucun doublon ne sera introduit entre
-deux sessions.
+| Méthode | Scope | Action par défaut | Si option activée |
+|---|---|---|---|
+| SHA256 | Tous fichiers | Déplacement vers `Doublon/` | **Suppression directe** |
+| pHash | Images uniquement | Déplacement vers `Doublon/` | Déplacement vers `Doublon/` |
+| Hash texte | PDFs uniquement | Déplacement vers `Doublon/` | Déplacement vers `Doublon/` |
 
-Le journal affiche explicitement cette phase :
+> Les doublons visuels (pHash) et PDF ne sont **jamais supprimés automatiquement**,
+> même si l'option SHA256 est activée — ils restent dans `Doublon/` pour vérification.
+
+---
+
+### ⟺ Mode Miroir
+
+Conçu pour dédupliquer et sauvegarder un dossier en conservant son organisation d'origine.
+
+- L'arborescence source est reproduite à l'identique dans la destination
+- Aucun renommage des fichiers
+- Aucun tri par catégorie
+- Seul le SHA256 est utilisé — doublon exact = **suppression directe**, sans dossier `Doublon/`
+
 ```
-🔍 Indexation de la destination : N fichier(s) déjà présent(s)…
-   (Les doublons avec ces fichiers seront détectés même si la source change.)
-✅ Indexation terminée — N fichier(s) référencé(s).
+source/                      destination/
+├── Vacances/                ├── Vacances/
+│   ├── 2023/                │   ├── 2023/
+│   │   ├── photo1.jpg  →    │   │   ├── photo1.jpg
+│   │   └── photo1_copie ✕   │   │   (supprimé — SHA256 identique)
+│   └── photo2.jpg      →    │   └── photo2.jpg
+└── Documents/               └── Documents/
+    └── rapport.pdf     →        └── rapport.pdf
+```
+
+---
+
+### 🔄 Indexation de la destination au démarrage
+
+À chaque lancement, ChronoSort scanne les fichiers **déjà présents** dans la destination
+et les intègre dans les structures de déduplication avant de traiter la source.
+
+Cela signifie que vous pouvez **réutiliser le même dossier de destination à chaque passe**,
+même si le dossier source change — aucun doublon ne sera introduit entre deux sessions.
+
+```
+🔍 Indexation de la destination : 2 000 fichier(s) déjà présent(s)…
+   (Les doublons seront détectés même si le dossier source change.)
+✅ Indexation terminée — 2 000 fichier(s) référencé(s).
 ```
 
 ---
@@ -125,20 +142,21 @@ python main.py
 
 ### Options disponibles dans l'interface
 
-| Option | Détail |
-|---|---|
-| **Déplacer les fichiers** | Déplace au lieu de copier ; supprime les dossiers vides après passage |
-| **Supprimer les doublons exacts (SHA256)** | Supprime directement les doublons identiques bit pour bit, sans confirmation. Les doublons visuels et PDF restent déplacés vers `Doublon/` |
-| **Seuil similarité visuelle** | De 0 (identique strict) à 10 (très permissif). Contrôle la tolérance du pHash pour les images |
-| **Annuler** | Interrompt proprement le traitement en cours |
+| Option | Mode | Détail |
+|---|---|---|
+| **Déplacer les fichiers** | Les deux | Déplace au lieu de copier ; supprime les dossiers vides source après passage |
+| **Supprimer les doublons exacts (SHA256)** | Tri uniquement | Supprime directement les doublons identiques bit pour bit, sans confirmation |
+| **Seuil similarité visuelle** | Tri uniquement | De 0 (identique strict) à 10 (très permissif). Contrôle la tolérance du pHash |
 
 ### Résumé affiché en fin de traitement
 
 ```
-✅ Traités      : 1 842
-🗑️  Supprimés    : 312
-📋 Doublons     : 47
-❌ Erreurs      : 0
+────────────────────────────────────────────────────
+  ✅  Traités    : 1 842
+  🗑️   Supprimés  : 312
+  📋  Doublons   : 47
+  ❌  Erreurs    : 0
+────────────────────────────────────────────────────
 ```
 
 ---
@@ -187,9 +205,9 @@ ChronoSort.spec   ← fichier de configuration PyInstaller
 
 ## ⚠️ Limites
 
-- Détection visuelle (pHash) : images uniquement
-- Détection PDF : ne fonctionne pas sur les PDFs entièrement scannés (sans texte extractible) — le SHA256 prend le relais
-- Sur très gros volumes (> 100 000 fichiers), l'indexation initiale de la destination peut prendre quelques secondes supplémentaires
+- Détection visuelle (pHash) : images uniquement, Mode Tri uniquement
+- Détection PDF : ne fonctionne pas sur les PDFs entièrement scannés — le SHA256 prend le relais
+- Sur très gros volumes (> 100 000 fichiers), l'indexation initiale peut prendre quelques secondes supplémentaires
 
 ---
 
